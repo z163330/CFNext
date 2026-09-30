@@ -513,6 +513,18 @@ function isTrustedRegionPool(url) {
   return TRUSTED_REGION_POOL_RE.test(String(url || ''));
 }
 
+// 根据选中的地区（字符串 'HK' 或数组 ['HK','SG']，'all'/空=全部）从 DEFAULT_REGION_POOLS 筛出对应地区的优选池 URL。
+// 用途：默认订阅模式下「指定地区」时拉取该地区专属池，真正生成该地区节点——否则只解析通用域名池，
+// 通用节点（优选IP-XX/域名-XX）会被 filterNodes 当作“通用入口”放行，无法限定地区（即无法单独生成指定地区）。
+function regionPoolsFor(sel) {
+  const codes = Array.isArray(sel) ? sel.filter(c => c && c !== 'all') : (sel && sel !== 'all' ? [sel] : []);
+  if (!codes.length) return '';
+  return String(DEFAULT_REGION_POOLS).split(/[\n,;]+/).filter(u => {
+    const m = String(u).match(/random-region\/([A-Z]{2,})/i);
+    return m && codes.some(c => String(c).toUpperCase() === m[1].toUpperCase());
+  }).join('\n');
+}
+
 const DEFAULT_CONFIG = {
   uuid: '',
   path: '',            // 自定义路径，留空用 UUID
@@ -2643,6 +2655,20 @@ async function buildNodes(cfg, cap = 800, skipSet = null) {
     // 数量 = 下发节点总数（含启用的所有协议），而非 IP 数：每个 IP 生成一条后计数，达 n 即止
     const protoCount = (cfg.enableVless ? 1 : 0) + (cfg.enableTrojan ? 1 : 0) + (cfg.enableXhttp ? 1 : 0) || 1;
     let made = 0;
+    // ★ 指定地区（region 非 all）：随机优选模式优先下发选中地区专属池节点（bestcf 中转 IP，带“香港-XX”等地区标记），
+    // 数量不足再回退 CF CIDR 随机补足——修复「随机优选模式下选择地区仍只出优选IP」的问题
+    const rpItems = (cfg._regionPool || []).filter(x => x && x.ip);
+    let rpIdx = 0;
+    while (made < n && rpIdx < rpItems.length) {
+      const it = rpItems[rpIdx++];
+      if (skipSet && skipSet.has(it.ip)) continue;   // 去重：已下发过的地区池 IP 跳过
+      const nmP = protoNames(it.name || ('优选IP-' + String(made + 1).padStart(2, '0')), !!cfg.enableVless, !!cfg.enableTrojan, !!cfg.enableXhttp);
+      if (cfg.enableVless) { nodes.push(vlessNode(cfg, it.ip, it.port || 443, nmP.v)); made++; }
+      if (made >= n) break;
+      if (cfg.enableTrojan) { nodes.push(trojanNode(cfg, it.ip, it.port || 443, nmP.t)); made++; }
+      if (made >= n) break;
+      if (cfg.enableXhttp) { nodes.push(vlessNode(cfg, it.ip, it.port || 443, nmP.x, { type: 'xhttp' })); made++; }
+    }
     // 去重下发：随机模式生成 3 倍数量后过滤已下发 IP；新 IP 排前、已下发 IP 紧随补齐，节点总量恒定
     const randPool = randomIPsFromCidrs(RAND_CIDRS, Math.ceil(n / protoCount) * 3);
     let randIPs = randPool;
@@ -3349,6 +3375,16 @@ function appendFallbackNodes(nodes, rc, cap, colo) {
 async function generateSubscription(cfg, requestUrl, format, ua, colo, env) {
   // 兜底：path 为空或为 "/" 时一律回退 UUID（兼容 KV 残留旧值；Worker WS/xhttp 代理仅在 panelPath=cfg.path 处理）
   if (!cfg.path || cfg.path === '/' || cfg.path === '') cfg.path = cfg.uuid;
+  // URL 参数 region= 覆盖面板地区筛选：支持单独生成指定地区订阅（如 sub?fmt=v2ray&region=HK，或 region=HK,SG 多地区）；
+  // 未传该参数时沿用面板配置的地区筛选，行为完全不变
+  const _rgParam = new URL(requestUrl).searchParams.get('region');
+  if (_rgParam) {
+    const _codes = String(_rgParam).split(/[,\s]+/).map(s => s.trim().toUpperCase()).filter(Boolean);
+    if (_codes.length) {
+      const _f0 = cfg.filter || {};
+      cfg = Object.assign({}, cfg, { filter: Object.assign({}, _f0, { region: _codes }) });
+    }
+  }
   // 筛选含 IPv6 时刷新官方 v6 网段（ips-v6，6 小时缓存节流；失败沿用内置/上次成功段）
   const _ipT0 = (cfg.filter && cfg.filter.ipType) || [];
   if (_ipT0.includes('IPv6')) await refreshOfficialV6CIDRs();
@@ -3420,6 +3456,19 @@ async function generateSubscription(cfg, requestUrl, format, ua, colo, env) {
   const RAND_CIDRS = onlyV6 ? OFFICIAL_V6_CIDRS : (wantV6 ? [...REACHABLE_CIDRS, ...OFFICIAL_V6_CIDRS] : REACHABLE_CIDRS);
   // 内置 Cloudflare 优选 IP（实测可达的 Anycast 兜底池，始终随订阅下发；无明确地区，名称统一“优选IP-XX”）
   const builtinIPs = parseIPList(BUILTIN_PREFERRED_IPS.join('\n')).map(x => ({ ip: x.ip, port: x.port || 443, name: x.name || ('优选IP-' + String(BUILTIN_PREFERRED_IPS.indexOf(x) + 1).padStart(2, '0')) }));
+  // ★ 指定地区（region 非 all）：所有订阅模式统一预解析选中地区的专属优选池（bestcf random-region/XX），
+  // 存到 rc._regionPool 供默认/随机优选模式使用——保证「选择地区 → 生成该地区节点」在所有模式下都生效；
+  // 地区池不可达时静默回退各模式原有来源（不影响原行为）
+  const _flR = cfg.filter || {};
+  const _regionSel = _flR.region;
+  const _regionAll = Array.isArray(_regionSel) ? (_regionSel.length === 0 || _regionSel.includes('all')) : (!_regionSel || _regionSel === 'all');
+  rc._regionPool = [];
+  if (!_regionAll && !onlyV6) {
+    try {
+      const _rp = regionPoolsFor(_regionSel);
+      if (_rp) rc._regionPool = await resolvePreferredDomains(_rp, 100, 600, true, true, false);
+    } catch (e) { rc._regionPool = []; }
+  }
   if (mode === 'custom') {
     // 自定义订阅（支持汇聚）：默认仅下发「优选节点」框内设置的节点（严格模式，不生成任何额外节点）；
     // 开启 subIncludeDefault 后追加内置优选 IP 池 + 默认 6 条地区源节点（含地区回退生成 + CF CIDR 补足），自定义与默认节点合并下发
@@ -3489,8 +3538,13 @@ async function generateSubscription(cfg, requestUrl, format, ua, colo, env) {
           if (v6dom && v6dom.length) rc.preferredIPs = [...(rc.preferredIPs || []), ...v6dom];
         } catch (e) { /* AAAA 解析失败不影响其它来源 */ }
       }
-    } else if (useDomain) {
-      resolved = await resolvePreferredDomains(DEFAULT_PREFERRED_DOMAINS, 100, 300, false, true, wantV6);
+    } else {
+      // 指定地区（非 all）：除通用域名池外，并入函数头部预解析的地区专属池（rc._regionPool），
+      // 使订阅真正包含该地区节点——修复“勾选地区后只出通用节点、无法单独生成指定地区”的问题
+      if (useDomain) {
+        resolved = await resolvePreferredDomains(DEFAULT_PREFERRED_DOMAINS, 100, 300, false, true, wantV6);
+      }
+      if ((rc._regionPool || []).length) rc.preferredIPs = [...(rc.preferredIPs || []), ...rc._regionPool];
     }
     // 内置实测池（IPv4）：单选 IPv6 时全量转 IPv4-embedded IPv6（2606:4700::<hex>，与对应 IPv4 路由到同一 CF 边缘，下发即用）；
     // 混合（IPv4+IPv6 同选）时全局下发——内置池全量保持 IPv4 且全量转 embedded IPv6，两侧都不削减
